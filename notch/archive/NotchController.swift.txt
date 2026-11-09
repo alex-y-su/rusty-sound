@@ -1,0 +1,422 @@
+import AppKit
+
+// MARK: - Geometry
+
+/// Where the notch is (or where the top-center fallback goes) in screen coordinates.
+struct NotchGeometry {
+    static let leftWing: CGFloat = 40
+    static let rightWing: CGFloat = 160
+    static let expandedSize = NSSize(width: 360, height: 124)
+
+    let centerX: CGFloat
+    let screenTop: CGFloat
+    let barHeight: CGFloat
+    let notchWidth: CGFloat
+
+    static func current() -> NotchGeometry {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else {
+            return NotchGeometry(centerX: 700, screenTop: 900, barHeight: 24, notchWidth: 0)
+        }
+        let frame = screen.frame
+        let menuBar = frame.maxY - screen.visibleFrame.maxY
+        let top = screen.safeAreaInsets.top
+
+        var centerX = frame.midX
+        var notchWidth: CGFloat = 0
+        if top > 0,
+           let left = screen.auxiliaryTopLeftArea,
+           let right = screen.auxiliaryTopRightArea,
+           right.minX > left.maxX {
+            notchWidth = right.minX - left.maxX
+            centerX = (left.maxX + right.minX) / 2
+        }
+        return NotchGeometry(
+            centerX: centerX,
+            screenTop: frame.maxY,
+            barHeight: max(top, menuBar, 24),
+            notchWidth: notchWidth
+        )
+    }
+
+    var collapsedWidth: CGFloat { Self.leftWing + notchWidth + Self.rightWing }
+
+    func frame(expanded: Bool) -> NSRect {
+        let width = expanded ? Self.expandedSize.width : collapsedWidth
+        let height = expanded ? Self.expandedSize.height : barHeight
+        return NSRect(x: centerX - width / 2, y: screenTop - height, width: width, height: height)
+    }
+}
+
+// MARK: - Panel
+
+final class NotchPanel: NSPanel {
+    init(contentRect: NSRect) {
+        super.init(
+            contentRect: contentRect,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        level = .statusBar
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        isFloatingPanel = true
+        hidesOnDeactivate = false
+        becomesKeyOnlyIfNeeded = true
+        isMovable = false
+        appearance = NSAppearance(named: .darkAqua)
+    }
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+// MARK: - Controller
+
+enum DisplayState {
+    case loading
+    case off
+    case failed(String)
+    case ok(NowState)
+}
+
+final class NotchController: NSObject {
+    private let panel = NotchPanel(contentRect: NSRect(x: 0, y: 0, width: 200, height: 30))
+    private let root = NSView()
+    private let collapsedView = NSView()
+    private let expandedView = NSView()
+
+    private let pillIcon = NSImageView()
+    private let pillTitle = NSTextField(labelWithString: "")
+    private var titleLeading: NSLayoutConstraint!
+
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let detailLabel = NSTextField(labelWithString: "")
+    private let prevButton = NSButton()
+    private let playButton = NSButton()
+    private let nextButton = NSButton()
+
+    private var expanded = false
+    private var state: DisplayState = .loading
+    private var notice: String?
+    private var pollInFlight = false
+    private var pollAgain = false
+    private var pollTimer: Timer?
+    private var monitors: [Any] = []
+    private let backend = DispatchQueue(label: "rusty-notch.cli")
+
+    override init() {
+        super.init()
+        buildUI()
+    }
+
+    func start() {
+        applyGeometry(animated: false)
+        panel.orderFrontRegardless()
+        installMonitors()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            self?.poll()
+        }
+        poll()
+    }
+
+    // MARK: UI construction
+
+    private func buildUI() {
+        root.wantsLayer = true
+        root.layer?.backgroundColor = NSColor.black.cgColor
+        root.layer?.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        root.layer?.cornerRadius = 14
+        panel.contentView = root
+
+        for view in [collapsedView, expandedView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            root.addSubview(view)
+            NSLayoutConstraint.activate([
+                view.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+                view.topAnchor.constraint(equalTo: root.topAnchor),
+                view.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            ])
+        }
+
+        // Collapsed pill: icon in the left wing, title to the right of the notch.
+        configureLabel(pillTitle, size: 12.5, weight: .medium, color: .white)
+        pillIcon.translatesAutoresizingMaskIntoConstraints = false
+        pillIcon.contentTintColor = .white
+        collapsedView.addSubview(pillIcon)
+        collapsedView.addSubview(pillTitle)
+        titleLeading = pillTitle.leadingAnchor.constraint(equalTo: collapsedView.leadingAnchor)
+        NSLayoutConstraint.activate([
+            pillIcon.leadingAnchor.constraint(equalTo: collapsedView.leadingAnchor, constant: 13),
+            pillIcon.centerYAnchor.constraint(equalTo: collapsedView.centerYAnchor),
+            pillIcon.widthAnchor.constraint(equalToConstant: 14),
+            pillIcon.heightAnchor.constraint(equalToConstant: 14),
+            titleLeading,
+            pillTitle.trailingAnchor.constraint(equalTo: collapsedView.trailingAnchor, constant: -12),
+            pillTitle.centerYAnchor.constraint(equalTo: collapsedView.centerYAnchor),
+        ])
+        collapsedView.addGestureRecognizer(
+            NSClickGestureRecognizer(target: self, action: #selector(pillClicked(_:)))
+        )
+
+        // Expanded panel: title, artist/detail line, transport row.
+        expandedView.isHidden = true
+        configureLabel(titleLabel, size: 15, weight: .semibold, color: .white)
+        configureLabel(detailLabel, size: 12, weight: .regular, color: NSColor(white: 1, alpha: 0.6))
+        expandedView.addSubview(titleLabel)
+        expandedView.addSubview(detailLabel)
+
+        configureTransportButton(prevButton, symbol: "backward.fill", action: nil)
+        prevButton.toolTip = "Previous track is not available: rusty-sound has no previous command yet"
+        configureTransportButton(playButton, symbol: "play.fill", action: #selector(playPauseTapped(_:)))
+        configureTransportButton(nextButton, symbol: "forward.fill", action: #selector(nextTapped(_:)))
+
+        let controls = NSStackView(views: [prevButton, playButton, nextButton])
+        controls.orientation = .horizontal
+        controls.alignment = .centerY
+        controls.spacing = 26
+        controls.translatesAutoresizingMaskIntoConstraints = false
+        expandedView.addSubview(controls)
+
+        NSLayoutConstraint.activate([
+            titleLabel.topAnchor.constraint(equalTo: expandedView.topAnchor, constant: 20),
+            titleLabel.leadingAnchor.constraint(equalTo: expandedView.leadingAnchor, constant: 22),
+            titleLabel.trailingAnchor.constraint(equalTo: expandedView.trailingAnchor, constant: -22),
+            detailLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 3),
+            detailLabel.leadingAnchor.constraint(equalTo: expandedView.leadingAnchor, constant: 22),
+            detailLabel.trailingAnchor.constraint(equalTo: expandedView.trailingAnchor, constant: -22),
+            controls.centerXAnchor.constraint(equalTo: expandedView.centerXAnchor),
+            controls.bottomAnchor.constraint(equalTo: expandedView.bottomAnchor, constant: -14),
+        ])
+
+        render()
+    }
+
+    private func configureLabel(_ label: NSTextField, size: CGFloat, weight: NSFont.Weight, color: NSColor) {
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: size, weight: weight)
+        label.textColor = color
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    }
+
+    private func configureTransportButton(_ button: NSButton, symbol: String, action: Selector?) {
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.isBordered = false
+        button.imagePosition = .imageOnly
+        button.contentTintColor = .white
+        button.focusRingType = .none
+        button.target = self
+        button.action = action
+        button.image = symbolImage(symbol, size: 18)
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 56),
+            button.heightAnchor.constraint(equalToConstant: 36),
+        ])
+    }
+
+    private func symbolImage(_ name: String, size: CGFloat) -> NSImage? {
+        let config = NSImage.SymbolConfiguration(pointSize: size, weight: .semibold)
+        return NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(config)
+    }
+
+    // MARK: Monitors and geometry
+
+    private func installMonitors() {
+        // Escape collapses the expanded panel.
+        if let m = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { [weak self] event in
+            guard let self, self.expanded, event.keyCode == 53 else { return event }
+            self.setExpanded(false)
+            return nil
+        }) {
+            monitors.append(m)
+        }
+
+        // A click anywhere outside the panel collapses it.
+        if let m = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown],
+            handler: { [weak self] _ in
+                guard let self, self.expanded else { return }
+                if !self.panel.frame.contains(NSEvent.mouseLocation) {
+                    self.setExpanded(false)
+                }
+            }) {
+            monitors.append(m)
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.applyGeometry(animated: false)
+        }
+    }
+
+    private func setExpanded(_ on: Bool) {
+        guard on != expanded else { return }
+        expanded = on
+        collapsedView.isHidden = on
+        expandedView.isHidden = !on
+        applyGeometry(animated: true)
+        if on { poll() }
+    }
+
+    private func applyGeometry(animated: Bool) {
+        let geo = NotchGeometry.current()
+        titleLeading.constant = NotchGeometry.leftWing + geo.notchWidth + 6
+        let target = geo.frame(expanded: expanded)
+        root.layer?.cornerRadius = expanded ? 22 : 14
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.18
+                self.panel.animator().setFrame(target, display: true)
+            }
+        } else {
+            panel.setFrame(target, display: true)
+        }
+    }
+
+    // MARK: Backend calls (run on `backend`, results applied on main)
+
+    private func poll() {
+        guard !pollInFlight else {
+            pollAgain = true
+            return
+        }
+        pollInFlight = true
+        backend.async {
+            let result = RustySoundClient.now()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.pollInFlight = false
+                switch result {
+                case .success(let s):
+                    self.notice = nil
+                    self.state = .ok(s)
+                case .serviceOff:
+                    self.state = .off
+                case .failure(let message):
+                    self.state = .failed(message)
+                }
+                self.render()
+                if self.pollAgain {
+                    self.pollAgain = false
+                    self.poll()
+                }
+            }
+        }
+    }
+
+    private func send(_ command: String) {
+        backend.async {
+            let result = RustySoundClient.command(command)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                switch result {
+                case .success:
+                    self.notice = nil
+                case .serviceOff:
+                    self.state = .off
+                case .failure(let message):
+                    self.notice = message
+                }
+                self.render()
+                self.poll()
+            }
+        }
+    }
+
+    // MARK: Actions
+
+    @objc private func pillClicked(_ sender: NSGestureRecognizer) {
+        setExpanded(true)
+    }
+
+    @objc private func playPauseTapped(_ sender: NSButton) {
+        guard case .ok(let s) = state else { return }
+        if s.playing {
+            send("pause")
+        } else if s.paused {
+            send("resume")
+        } else {
+            send("play")
+        }
+    }
+
+    @objc private func nextTapped(_ sender: NSButton) {
+        send("next")
+    }
+
+    // MARK: Rendering
+
+    private func render() {
+        var icon = "music.note"
+        var title = ""
+        var detail = ""
+        var canControl = false
+        var playIcon = "play.fill"
+
+        switch state {
+        case .loading:
+            title = "Loading"
+        case .off:
+            icon = "moon.zzz.fill"
+            title = "Off"
+            detail = "Rusty Sound service is not running"
+        case .failed(let message):
+            icon = "exclamationmark.triangle.fill"
+            title = "Unavailable"
+            detail = message
+        case .ok(let s):
+            canControl = true
+            if s.playing {
+                icon = "waveform"
+            } else if s.paused {
+                icon = "pause.fill"
+            }
+            playIcon = s.playing ? "pause.fill" : "play.fill"
+            if let parts = Self.splitNow(s.now) {
+                title = parts.title
+                detail = parts.artist ?? ""
+            } else {
+                title = "Nothing playing"
+                detail = s.queued > 0 ? "\(s.queued) queued" : "Queue is empty"
+            }
+            if let error = s.error, !error.isEmpty {
+                detail = error
+            }
+        }
+        if let notice = notice {
+            detail = notice
+        }
+
+        pillIcon.image = symbolImage(icon, size: 12)
+        pillTitle.stringValue = title
+        titleLabel.stringValue = title
+        detailLabel.stringValue = detail
+
+        playButton.image = symbolImage(playIcon, size: 18)
+        playButton.isEnabled = canControl
+        playButton.alphaValue = canControl ? 1 : 0.3
+        nextButton.isEnabled = canControl
+        nextButton.alphaValue = canControl ? 1 : 0.3
+        // No previous-track backend exists yet, so prev stays disabled.
+        prevButton.isEnabled = false
+        prevButton.alphaValue = 0.3
+    }
+
+    /// Splits "Title — Artist" on the last em dash. Returns nil when nothing is playing.
+    static func splitNow(_ now: String?) -> (title: String, artist: String?)? {
+        guard let now = now, !now.isEmpty else { return nil }
+        if let range = now.range(of: " — ", options: .backwards) {
+            return (String(now[..<range.lowerBound]), String(now[range.upperBound...]))
+        }
+        return (now, nil)
+    }
+}
